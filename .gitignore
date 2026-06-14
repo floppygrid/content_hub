@@ -1,0 +1,6 @@
+client_secrets.json
+meta_app_credentials.json
+token_*.json
+upload_results*.csv
+videos_books_pages_and_rain/
+__pycache__/
