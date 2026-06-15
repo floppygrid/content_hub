@@ -883,8 +883,33 @@ def upload_to_instagram(ig_user_id: str, ig_token: str,
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _parse_schedule_time(s: str) -> int:
-    dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    import re
+    s = s.replace("Z", "+00:00")
+    s = re.sub(r'T(\d):', r'T0\1:', s)   # pad single-digit hour: T5: → T05:
+    dt = datetime.fromisoformat(s)
     return int(dt.timestamp())
+
+
+def _normalize_schedule_time(s: str) -> str:
+    """If schedule_time is in the past, bump it to 1 day ahead (same time).
+    Returns the original string if it's still in the future, or empty."""
+    if not s:
+        return s
+    import re
+    now = datetime.now(timezone.utc)
+    _s  = re.sub(r'T(\d):', r'T0\1:', s.replace("Z", "+00:00"))
+    dt  = datetime.fromisoformat(_s)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    if dt > now:
+        return s
+    from datetime import timedelta
+    bumped = datetime.now(timezone.utc).replace(
+        hour=dt.hour, minute=dt.minute, second=dt.second, microsecond=0
+    ) + timedelta(days=1)
+    bumped_str = bumped.strftime("%Y-%m-%dT%H:%M:%SZ")
+    print(f"  ⏰  schedule_time was in the past — bumped to {bumped_str}")
+    return bumped_str
 
 
 def load_yt_done(yt_results_file: str) -> set:
@@ -1082,6 +1107,11 @@ def run_upload_batch(
         filename   = row["file"].strip()
         title      = row.get("title", filename).strip()
         video_path = os.path.join(videos_folder, filename)
+
+        # Bump past schedule times to tomorrow (same time of day)
+        if row.get("schedule_time", "").strip():
+            row = dict(row)  # don't mutate the original
+            row["schedule_time"] = _normalize_schedule_time(row["schedule_time"].strip())
 
         print(f"[{i}/{len(to_upload)}] {title}")
 
