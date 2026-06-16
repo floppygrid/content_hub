@@ -4,3 +4,19 @@ token_*.json
 upload_results*.csv
 videos_books_pages_and_rain/
 __pycache__/
+
+# Mac system files
+.DS_Store
+
+# Video and photo folders (large binary files)
+videos_*/
+photos_*/
+
+# Playwright browser profile
+playwright_profile/
+
+# Local CSV data files (stay on your machine)
+*.csv
+
+# Generated files
+generated_images/
