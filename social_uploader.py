@@ -58,9 +58,22 @@ YT_CATEGORY_IDS = {
 
 
 def parse_tags(raw: str) -> list:
+    """Parse tags and enforce YouTube's limits:
+    - Max 500 characters total (counted as comma-separated, no spaces)
+    - Max 15 tags
+    """
     if not raw:
         return []
-    return [t.strip() for t in raw.split(",") if t.strip()]
+    tags = [t.strip() for t in raw.split(",") if t.strip()]
+    result = []
+    total = 0
+    for tag in tags[:15]:          # hard cap at 15 tags
+        addition = len(tag) + (1 if result else 0)
+        if total + addition > 450:  # conservative character limit
+            break
+        result.append(tag)
+        total += addition
+    return result
 
 
 def resolve_category(value: str) -> str:
@@ -165,6 +178,13 @@ MAX_RETRIES             = 10
 RETRY_BASE_DELAY        = 5
 CONTAINER_POLL_INTERVAL = 5
 CONTAINER_POLL_TIMEOUT  = 300
+
+IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.webp'}
+
+
+def is_image_file(filename: str) -> bool:
+    """Return True if the file is an image/photo (not a video)."""
+    return Path(filename).suffix.lower() in IMAGE_EXTENSIONS
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -377,25 +397,29 @@ Step 2: Generate a User Access Token with Instagram permissions
             ig_username = ig_accounts[0].get("username", ig_user_id)
 
     if not ig_user_id:
-        print("""
-  ⚠️  Could not find your Instagram account automatically.
+        # Fall back to saved credentials in creds_file
+        with open(creds_file) as f:
+            _creds = json.load(f)
+        ig_user_id  = _creds.get("ig_user_id", "").strip()
+        ig_username = _creds.get("ig_username", "").strip()
 
-  This can happen when the token doesn't include instagram_business_basic,
-  or when the Instagram account isn't linked via Business Manager.
+        if ig_user_id:
+            print(f"  ✅  Using saved Instagram credentials from {creds_file}")
+        else:
+            print("""
+  ⚠️  Could not find your Instagram account automatically.
 
   You can enter your Instagram details manually instead:
     • Instagram User ID: find it in Meta Business Suite → Settings
       → Accounts → Instagram accounts → click your account
-    • Or visit: https://www.instagram.com/[yourusername]/?__a=1&__d=dis
-      and look for "id" (must be logged in)
 """)
-        manual = input("Enter manually? (y/n): ").strip().lower()
-        if manual == "y":
-            ig_user_id  = input("Instagram User ID (numbers only): ").strip()
-            ig_username = input("Instagram username (without @): ").strip()
-        else:
-            print("❌  Setup cancelled.")
-            sys.exit(1)
+            manual = input("Enter manually? (y/n): ").strip().lower()
+            if manual == "y":
+                ig_user_id  = input("Instagram User ID (numbers only): ").strip()
+                ig_username = input("Instagram username (without @): ").strip()
+            else:
+                print("❌  Setup cancelled.")
+                sys.exit(1)
 
     print(f"✅  Instagram account: @{ig_username}  (ID: {ig_user_id})")
 
@@ -879,34 +903,328 @@ def upload_to_instagram(ig_user_id: str, ig_token: str,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  FACEBOOK PHOTO UPLOAD
+# ══════════════════════════════════════════════════════════════════════════════
+
+def upload_photo_to_facebook(page_id: str, page_token: str, app_id: str,
+                              image_path: str, metadata: dict) -> tuple:
+    """
+    Upload a photo to a Facebook Page.
+    Returns (photo_id, cdn_url) — cdn_url can be used for Instagram.
+    """
+    file_name     = os.path.basename(image_path)
+    caption       = (metadata.get("social_media_description", "").strip()
+                     or metadata.get("description", "").strip())
+    schedule_time = metadata.get("schedule_time", "").strip()
+
+    fields: dict = {
+        "access_token": page_token,
+        "caption":      caption,
+    }
+    if schedule_time:
+        ts = _parse_schedule_time(schedule_time)
+        if ts <= int(time.time()) + 600:
+            raise ValueError("schedule_time must be at least 10 min in the future")
+        fields["published"]                = "false"
+        fields["scheduled_publish_time"]   = str(ts)
+    else:
+        fields["published"] = "true"
+
+    print(f"    Uploading {file_name}...")
+    for attempt in range(MAX_RETRIES):
+        try:
+            with open(image_path, "rb") as f:
+                resp = requests.post(
+                    f"{FB_BASE}/{page_id}/photos",
+                    data=fields,
+                    files={"source": (file_name, f, "image/jpeg")},
+                    timeout=120,
+                )
+            if not resp.ok:
+                raise RuntimeError(f"FB photo upload failed ({resp.status_code}): {resp.text}")
+            data = resp.json()
+            if "id" not in data:
+                raise RuntimeError(f"FB photo upload returned no ID: {data}")
+            photo_id = data["id"]
+            break
+        except RuntimeError:
+            raise
+        except Exception as e:
+            if attempt < MAX_RETRIES - 1:
+                wait = RETRY_BASE_DELAY * (2 ** attempt)
+                print(f"    Retry {attempt + 1}/{MAX_RETRIES} in {wait}s ({e})")
+                time.sleep(wait)
+            else:
+                raise RuntimeError(f"FB photo upload failed after {MAX_RETRIES} attempts: {e}")
+
+    # Fetch CDN URL so Instagram can use it as image_url
+    cdn_url = ""
+    try:
+        time.sleep(2)  # brief wait for CDN propagation
+        url_resp = requests.get(
+            f"{FB_BASE}/{photo_id}",
+            params={"fields": "images", "access_token": page_token},
+            timeout=30,
+        )
+        if url_resp.ok:
+            images = url_resp.json().get("images", [])
+            if images:
+                cdn_url = images[0].get("source", "")
+    except Exception:
+        pass  # Instagram will be skipped with a warning if cdn_url stays empty
+
+    return photo_id, cdn_url
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  INSTAGRAM PHOTO UPLOAD
+# ══════════════════════════════════════════════════════════════════════════════
+
+def upload_photo_to_instagram(ig_user_id: str, ig_token: str,
+                               image_path: str, metadata: dict,
+                               image_url: str = "") -> str:
+    """
+    Upload a photo to Instagram via the Content Publishing API.
+    Requires a publicly accessible image URL — pass fb_cdn_url from Facebook upload,
+    or add an 'image_url' column to your CSV with a public URL.
+    """
+    if not image_url:
+        raise RuntimeError(
+            "Instagram photo upload requires a public image URL. "
+            "Upload to Facebook first (provides CDN URL automatically), "
+            "or add an 'image_url' column to your CSV."
+        )
+
+    caption       = (metadata.get("social_media_description", "").strip()
+                     or metadata.get("description", "").strip())
+    schedule_time = metadata.get("schedule_time", "").strip()
+
+    params: dict = {
+        "access_token": ig_token,
+        "media_type":   "IMAGE",
+        "image_url":    image_url,
+        "caption":      caption,
+    }
+    if schedule_time:
+        ts = _parse_schedule_time(schedule_time)
+        if ts <= int(time.time()) + 600:
+            raise ValueError("schedule_time must be at least 10 min in the future")
+        params["published"]              = "false"
+        params["scheduled_publish_time"] = str(ts)
+
+    # Create media container
+    init_resp = requests.post(
+        f"{FB_BASE}/{ig_user_id}/media",
+        params=params,
+        timeout=60,
+    )
+    if not init_resp.ok:
+        raise RuntimeError(
+            f"IG photo container init failed ({init_resp.status_code}): {init_resp.text}"
+        )
+    init_data = init_resp.json()
+    if "id" not in init_data:
+        raise RuntimeError(f"IG photo container init failed: {init_data}")
+    creation_id = init_data["id"]
+
+    # Poll for processing
+    print("    ⏳ Processing...", end="", flush=True)
+    elapsed = 0
+    while elapsed < CONTAINER_POLL_TIMEOUT:
+        sr = requests.get(
+            f"{FB_BASE}/{creation_id}",
+            params={"fields": "status_code,status", "access_token": ig_token},
+            timeout=30,
+        )
+        sr.raise_for_status()
+        status_code = sr.json().get("status_code", "")
+        if status_code == "FINISHED":
+            print(" ready.")
+            break
+        elif status_code in ("ERROR", "EXPIRED"):
+            raise RuntimeError(f"IG photo container failed: {status_code}")
+        print(".", end="", flush=True)
+        time.sleep(CONTAINER_POLL_INTERVAL)
+        elapsed += CONTAINER_POLL_INTERVAL
+    else:
+        raise TimeoutError("IG photo container timed out.")
+
+    if schedule_time:
+        return creation_id
+
+    # Publish
+    pub_resp = requests.post(
+        f"{FB_BASE}/{ig_user_id}/media_publish",
+        params={"creation_id": creation_id, "access_token": ig_token},
+        timeout=60,
+    )
+    if not pub_resp.ok:
+        raise RuntimeError(f"IG photo publish failed ({pub_resp.status_code}): {pub_resp.text}")
+    data = pub_resp.json()
+    if "id" not in data:
+        raise RuntimeError(f"IG photo publish returned no ID: {data}")
+    return data["id"]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  TIKTOK PHOTO UPLOAD
+# ══════════════════════════════════════════════════════════════════════════════
+
+def upload_photo_to_tiktok(access_token: str, open_id: str,
+                            image_path: str, metadata: dict) -> str:
+    """
+    Upload a photo to TikTok using the Content Posting API v2 (photo/carousel post).
+    """
+    file_size = os.path.getsize(image_path)
+    file_name = os.path.basename(image_path)
+
+    caption = (metadata.get("social_media_description", "").strip()
+               or metadata.get("description", "").strip()
+               or "")[:2200]
+
+    privacy_map = {
+        "public":   "PUBLIC_TO_EVERYONE",
+        "private":  "SELF_ONLY",
+        "unlisted": "FOLLOWER_OF_CREATOR",
+    }
+    privacy = privacy_map.get(
+        metadata.get("privacy", "public").lower(), "PUBLIC_TO_EVERYONE"
+    )
+
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type":  "application/json; charset=UTF-8",
+    }
+
+    # Init photo post
+    init_resp = requests.post(
+        f"{TT_BASE}/post/publish/content/init/",
+        json={
+            "post_info": {
+                "title":            caption,
+                "privacy_level":    privacy,
+                "disable_comment":  False,
+                "auto_add_music":   True,
+                "post_mode":        "DIRECT_POST",
+                "media_type":       "PHOTO",
+            },
+            "source_info": {
+                "source":                "FILE_UPLOAD",
+                "photo_cover_index":     0,
+                "photo_image_size_list": [{"image_size": file_size}],
+            },
+        },
+        headers=headers,
+        timeout=60,
+    )
+    if not init_resp.ok:
+        raise RuntimeError(
+            f"TikTok photo init failed ({init_resp.status_code}): {init_resp.text}"
+        )
+
+    init_data        = init_resp.json().get("data", {})
+    publish_id       = init_data.get("publish_id")
+    upload_url_list  = init_data.get("upload_url_list", [])
+    if not publish_id or not upload_url_list:
+        raise RuntimeError(f"TikTok photo init missing data: {init_resp.text}")
+
+    # Upload the image to the provided URL
+    print(f"    Uploading {file_name} ({file_size / 1024:.0f} KB)...")
+    with open(image_path, "rb") as f:
+        image_data = f.read()
+
+    for attempt in range(MAX_RETRIES):
+        try:
+            r = requests.put(
+                upload_url_list[0],
+                headers={"Content-Type": "image/jpeg"},
+                data=image_data,
+                timeout=120,
+            )
+            r.raise_for_status()
+            break
+        except Exception as e:
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(RETRY_BASE_DELAY * (2 ** attempt))
+            else:
+                raise RuntimeError(f"TikTok photo upload failed: {e}")
+
+    # Poll for publish status
+    print("    ⏳ Processing...", end="", flush=True)
+    elapsed = 0
+    while elapsed < CONTAINER_POLL_TIMEOUT:
+        sr = requests.post(
+            f"{TT_BASE}/post/publish/status/fetch/",
+            json={"publish_id": publish_id},
+            headers=headers,
+            timeout=30,
+        )
+        if sr.ok:
+            status = sr.json().get("data", {}).get("status", "")
+            if status == "PUBLISH_COMPLETE":
+                print(" done.")
+                return publish_id
+            elif status in ("FAILED", "PUBLISH_FAILED"):
+                raise RuntimeError(f"TikTok photo publish failed: {sr.text}")
+        print(".", end="", flush=True)
+        time.sleep(CONTAINER_POLL_INTERVAL)
+        elapsed += CONTAINER_POLL_INTERVAL
+    raise TimeoutError("TikTok photo upload timed out.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  SHARED
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _parse_schedule_time(s: str) -> int:
+    """Parse a schedule_time string into a UTC Unix timestamp.
+
+    Accepts:
+      2026-06-16T10:00:00Z          (UTC, existing format)
+      2026-06-16T10:00:00+00:00     (UTC with offset)
+      2026-06-16 02:30:00 EDT       (New York summer time)
+      2026-06-16 02:30:00 EST       (New York winter time)
+      And any other US named timezone abbreviation below.
+    """
     import re
+    s = s.strip()
+
+    # Map common US timezone abbreviations to fixed UTC offsets
+    _TZ_OFFSETS = {
+        "EDT": "-04:00", "EST": "-05:00",
+        "CDT": "-05:00", "CST": "-06:00",
+        "MDT": "-06:00", "MST": "-07:00",
+        "PDT": "-07:00", "PST": "-08:00",
+        "UTC": "+00:00", "GMT": "+00:00",
+    }
+    for abbr, offset in _TZ_OFFSETS.items():
+        if s.upper().endswith(abbr):
+            s = s[: -len(abbr)].strip() + offset
+            break
+
+    s = re.sub(r'(\d{4}-\d{2}-\d{2})\s+(\d)', r'\1T\2', s)  # space → T separator
     s = s.replace("Z", "+00:00")
     s = re.sub(r'T(\d):', r'T0\1:', s)   # pad single-digit hour: T5: → T05:
+
     dt = datetime.fromisoformat(s)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
     return int(dt.timestamp())
 
 
 def _normalize_schedule_time(s: str) -> str:
-    """If schedule_time is in the past, bump it to 1 day ahead (same time).
-    Returns the original string if it's still in the future, or empty."""
+    """If schedule_time is in the past, bump it to 1 day ahead (same time of day).
+    Returns the original string if it's still in the future, or empty string if blank."""
     if not s:
         return s
-    import re
+    from datetime import timedelta
     now = datetime.now(timezone.utc)
-    _s  = re.sub(r'T(\d):', r'T0\1:', s.replace("Z", "+00:00"))
-    dt  = datetime.fromisoformat(_s)
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
+    ts  = _parse_schedule_time(s)
+    dt  = datetime.fromtimestamp(ts, tz=timezone.utc)
     if dt > now:
         return s
-    from datetime import timedelta
-    bumped = datetime.now(timezone.utc).replace(
-        hour=dt.hour, minute=dt.minute, second=dt.second, microsecond=0
-    ) + timedelta(days=1)
+    bumped     = now.replace(hour=dt.hour, minute=dt.minute,
+                             second=dt.second, microsecond=0) + timedelta(days=1)
     bumped_str = bumped.strftime("%Y-%m-%dT%H:%M:%SZ")
     print(f"  ⏰  schedule_time was in the past — bumped to {bumped_str}")
     return bumped_str
@@ -1079,15 +1397,21 @@ def run_upload_batch(
     ig_done = load_ig_done(results_file)     if ig_ready  else set()
     tt_done = load_tt_done(tt_results_file)  if tt_ready  else set()
 
-    def needs_upload(filename: str) -> bool:
-        if yt_client and filename not in yt_done: return True
-        if fb_ready  and filename not in fb_done: return True
-        if ig_ready  and filename not in ig_done: return True
-        if tt_ready  and filename not in tt_done: return True
+    def _resolve_filename(fname_csv: str) -> str:
+        """Add .jpeg extension if the CSV entry has no extension (photo batch)."""
+        return fname_csv if Path(fname_csv).suffix else fname_csv + ".jpeg"
+
+    def needs_upload(row: dict) -> bool:
+        fname = _resolve_filename(row.get("file", "").strip())
+        _photo = is_image_file(fname)
+        if not _photo and yt_client and fname not in yt_done: return True
+        if fb_ready  and fname not in fb_done: return True
+        if ig_ready  and fname not in ig_done: return True
+        if tt_ready  and fname not in tt_done: return True
         return False
 
     eligible  = [r for r in all_rows
-                 if r.get("file", "").strip() and needs_upload(r["file"].strip())]
+                 if r.get("file", "").strip() and needs_upload(r)]
     skipped   = len(all_rows) - len(eligible)
     to_upload = eligible[:limit] if limit > 0 else eligible
 
@@ -1104,9 +1428,11 @@ def run_upload_batch(
     success = fail = 0
 
     for i, row in enumerate(to_upload, 1):
-        filename   = row["file"].strip()
-        title      = row.get("title", filename).strip()
-        video_path = os.path.join(videos_folder, filename)
+        filename_csv = row["file"].strip()
+        filename     = _resolve_filename(filename_csv)   # adds .jpeg if no extension
+        is_photo     = is_image_file(filename)
+        title        = row.get("title", filename).strip()
+        video_path   = os.path.join(videos_folder, filename)
 
         # Bump past schedule times to tomorrow (same time of day)
         if row.get("schedule_time", "").strip():
@@ -1129,9 +1455,11 @@ def run_upload_batch(
         if dry_run:
             caption = (row.get("social_media_description", "")
                        or row.get("description", "") or title)
-            print(f"  ✔  [DRY RUN] '{filename}'")
+            kind = "📷 photo" if is_photo else "🎬 video"
+            print(f"  ✔  [DRY RUN] '{filename}' ({kind})")
             print(f"       caption: {caption[:80]}")
-            if yt_client: print(f"       → YouTube")
+            if yt_client and not is_photo: print(f"       → YouTube")
+            if is_photo and yt_client:     print(f"       → YouTube  (skipped — photos not supported)")
             if fb_ready:  print(f"       → Facebook:  {fb_page_name}")
             if ig_ready:  print(f"       → Instagram: @{ig_username}")
             if tt_ready:  print(f"       → TikTok")
@@ -1139,18 +1467,24 @@ def run_upload_batch(
             continue
 
         fb_video_id = ig_media_id = yt_video_id = tt_publish_id = ""
+        fb_cdn_url  = ""   # CDN URL from Facebook photo upload — passed to Instagram
         errors = []
 
-        # ── YouTube ──
-        if yt_client and filename not in yt_done:
+        # ── YouTube ── (photos not supported on YouTube)
+        if is_photo and yt_client:
+            pass  # silently skip
+
+        if not is_photo and yt_client and filename not in yt_done:
             print("  🎬 Uploading to YouTube...")
+            _yt_tags = parse_tags(row.get("tags", ""))
+            print(f"  🏷  YouTube tags ({len(_yt_tags)}): {_yt_tags}")
             try:
                 yt_video_id = yt_upload_video(
                     yt_client,
                     video_path  = video_path,
                     title       = title,
                     description = row.get("description", ""),
-                    tags        = parse_tags(row.get("tags", "")),
+                    tags        = _yt_tags,
                     category_id = resolve_category(row.get("category", "")),
                     privacy     = row.get("privacy", "private").lower(),
                     publish_at  = row.get("schedule_time", "").strip() or None,
@@ -1170,52 +1504,102 @@ def run_upload_batch(
 
         # ── Facebook ──
         if fb_ready and filename not in fb_done:
-            print("  📘 Uploading to Facebook...")
-            try:
-                fb_video_id = upload_to_facebook(
-                    fb_page_id, fb_page_token, fb_app_id, video_path, row)
-                print(f"  ✅  Facebook — video ID: {fb_video_id}")
-                if filename in rows_by_file:
-                    rows_by_file[filename]["facebook"] = "✅"
-                    save_csv()
-            except Exception as e:
-                print(f"  ❌  Facebook failed: {e}")
-                errors.append(f"FB: {e}")
+            if is_photo:
+                print("  📘 Uploading photo to Facebook...")
+                try:
+                    fb_photo_id, fb_cdn_url = upload_photo_to_facebook(
+                        fb_page_id, fb_page_token, fb_app_id, video_path, row)
+                    fb_video_id = fb_photo_id   # reuse field for logging
+                    print(f"  ✅  Facebook — photo ID: {fb_video_id}")
+                    if filename_csv in rows_by_file:
+                        rows_by_file[filename_csv]["facebook"] = "✅"
+                        save_csv()
+                except Exception as e:
+                    print(f"  ❌  Facebook failed: {e}")
+                    errors.append(f"FB: {e}")
+            else:
+                print("  📘 Uploading to Facebook...")
+                try:
+                    fb_video_id = upload_to_facebook(
+                        fb_page_id, fb_page_token, fb_app_id, video_path, row)
+                    print(f"  ✅  Facebook — video ID: {fb_video_id}")
+                    if filename in rows_by_file:
+                        rows_by_file[filename]["facebook"] = "✅"
+                        save_csv()
+                except Exception as e:
+                    print(f"  ❌  Facebook failed: {e}")
+                    errors.append(f"FB: {e}")
 
         # ── Instagram ──
         if ig_ready and filename not in ig_done:
-            print("  📸 Uploading to Instagram...")
-            try:
-                ig_media_id = upload_to_instagram(
-                    ig_user_id, ig_token, video_path, row)
-                print(f"  ✅  Instagram — media ID: {ig_media_id}")
-                if filename in rows_by_file:
-                    rows_by_file[filename]["instagram"] = "✅"
-                    save_csv()
-            except Exception as e:
-                print(f"  ❌  Instagram failed: {e}")
-                errors.append(f"IG: {e}")
+            if is_photo:
+                # Use CDN URL from FB upload, or explicit 'image_url' column in CSV
+                img_url = fb_cdn_url or row.get("image_url", "").strip()
+                if not img_url:
+                    print("  ⚠️  Instagram photo skipped — need public image URL.")
+                    print("       (FB upload provides this automatically; "
+                          "or add an 'image_url' column to your CSV)")
+                    errors.append("IG: no public image URL available")
+                else:
+                    print("  📸 Uploading photo to Instagram...")
+                    try:
+                        ig_media_id = upload_photo_to_instagram(
+                            ig_user_id, ig_token, video_path, row,
+                            image_url=img_url)
+                        print(f"  ✅  Instagram — media ID: {ig_media_id}")
+                        if filename_csv in rows_by_file:
+                            rows_by_file[filename_csv]["instagram"] = "✅"
+                            save_csv()
+                    except Exception as e:
+                        print(f"  ❌  Instagram failed: {e}")
+                        errors.append(f"IG: {e}")
+            else:
+                print("  📸 Uploading to Instagram...")
+                try:
+                    ig_media_id = upload_to_instagram(
+                        ig_user_id, ig_token, video_path, row)
+                    print(f"  ✅  Instagram — media ID: {ig_media_id}")
+                    if filename in rows_by_file:
+                        rows_by_file[filename]["instagram"] = "✅"
+                        save_csv()
+                except Exception as e:
+                    print(f"  ❌  Instagram failed: {e}")
+                    errors.append(f"IG: {e}")
 
         # ── TikTok ──
         if tt_ready and filename not in tt_done:
-            print("  🎵 Uploading to TikTok...")
-            try:
-                tt_publish_id = upload_to_tiktok(
-                    tt_access_token, tt_open_id, video_path, row)
-                print(f"  ✅  TikTok — publish ID: {tt_publish_id}")
-                if filename in rows_by_file:
-                    rows_by_file[filename]["tiktok"] = "✅"
-                    save_csv()
-                _log_tt_result(tt_results_file, filename, title, tt_publish_id)
-            except Exception as e:
-                print(f"  ❌  TikTok failed: {e}")
-                errors.append(f"TT: {e}")
+            if is_photo:
+                print("  🎵 Uploading photo to TikTok...")
+                try:
+                    tt_publish_id = upload_photo_to_tiktok(
+                        tt_access_token, tt_open_id, video_path, row)
+                    print(f"  ✅  TikTok — publish ID: {tt_publish_id}")
+                    if filename_csv in rows_by_file:
+                        rows_by_file[filename_csv]["tiktok"] = "✅"
+                        save_csv()
+                    _log_tt_result(tt_results_file, filename, title, tt_publish_id)
+                except Exception as e:
+                    print(f"  ❌  TikTok failed: {e}")
+                    errors.append(f"TT: {e}")
+            else:
+                print("  🎵 Uploading to TikTok...")
+                try:
+                    tt_publish_id = upload_to_tiktok(
+                        tt_access_token, tt_open_id, video_path, row)
+                    print(f"  ✅  TikTok — publish ID: {tt_publish_id}")
+                    if filename in rows_by_file:
+                        rows_by_file[filename]["tiktok"] = "✅"
+                        save_csv()
+                    _log_tt_result(tt_results_file, filename, title, tt_publish_id)
+                except Exception as e:
+                    print(f"  ❌  TikTok failed: {e}")
+                    errors.append(f"TT: {e}")
 
         print()
         any_success = bool(yt_video_id or fb_video_id or ig_media_id or tt_publish_id)
         status = "success" if not errors else ("partial" if any_success else "error")
         log_result(results_file, {
-            "file": filename, "title": title,
+            "file": filename, "title": title,   # filename is the disk name (with extension)
             "fb_video_id": fb_video_id, "ig_media_id": ig_media_id,
             "status": status, "error": "; ".join(errors),
             "uploaded_at": datetime.now(timezone.utc).isoformat(),
