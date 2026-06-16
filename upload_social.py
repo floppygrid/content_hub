@@ -1,38 +1,25 @@
 """
-upload_social.py — Launcher for Books Pages and Rain:
-  YouTube + Facebook + Instagram + TikTok
+upload_social.py — Run all channels in one go:
+  • Books Pages and Rain    (videos → YouTube + Facebook + Instagram + TikTok)
+  • Daisy and the Dance Team (videos → YouTube + Facebook + Instagram + TikTok)
+  • Daisy and the Dance Team (photos → Facebook + Instagram + TikTok)
 
 Commands:
-  python3 upload_social.py                      # upload to all platforms
+  python3 upload_social.py                      # upload everything pending across all channels
   python3 upload_social.py --dry-run            # validate without uploading
-  python3 upload_social.py --limit 3            # upload only 3 videos
-  python3 upload_social.py --youtube-only       # YouTube only
-  python3 upload_social.py --facebook-only      # Facebook only
-  python3 upload_social.py --instagram-only     # Instagram only
-  python3 upload_social.py --tiktok-only        # TikTok only
-  python3 upload_social.py --setup              # set up Facebook + Instagram
-  python3 upload_social.py --setup-facebook     # set up Facebook only
-  python3 upload_social.py --setup-instagram    # set up Instagram only
-  python3 upload_social.py --setup-tiktok       # set up TikTok only
-  (YouTube authenticates automatically on first run — opens a browser)
+  python3 upload_social.py --limit 3            # upload only 3 items per channel
+  python3 upload_social.py --youtube-only
+  python3 upload_social.py --facebook-only
+  python3 upload_social.py --instagram-only
+  python3 upload_social.py --tiktok-only
+  python3 upload_social.py --setup              # set up Facebook + Instagram (all channels)
+  python3 upload_social.py --setup-facebook
+  python3 upload_social.py --setup-instagram
+  python3 upload_social.py --setup-tiktok
 """
 
 import argparse
 import sys
-from pathlib import Path
-
-# ─── Channel config ───────────────────────────────────────────────────────────
-
-PROFILE_NAME     = "books-pages-and-rain"
-CSV_FILE         = "videos_books_pages_and_rain.csv"
-VIDEOS_FOLDER    = "videos_books_pages_and_rain"
-CREDS_FILE       = "meta_app_credentials.json"       # stores Meta + TikTok creds
-FB_TOKEN_FILE    = f"token_fb_{PROFILE_NAME}.json"
-IG_TOKEN_FILE    = f"token_ig_{PROFILE_NAME}.json"
-TT_TOKEN_FILE    = f"token_tt_{PROFILE_NAME}.json"
-RESULTS_FILE     = f"upload_results_social_{PROFILE_NAME}.csv"
-TT_RESULTS_FILE  = f"upload_results_tiktok_{PROFILE_NAME}.csv"
-YT_RESULTS_FILE  = "upload_results.csv"
 
 # ─── Import engine ────────────────────────────────────────────────────────────
 
@@ -47,7 +34,7 @@ except ImportError:
 # ─── Parse args ───────────────────────────────────────────────────────────────
 
 parser = argparse.ArgumentParser(
-    description="Upload videos to YouTube, Facebook, Instagram & TikTok"
+    description="Upload all pending content across all channels"
 )
 parser.add_argument("--setup",            action="store_true", help="Set up Facebook + Instagram")
 parser.add_argument("--setup-facebook",   action="store_true", help="Set up Facebook only")
@@ -58,36 +45,91 @@ parser.add_argument("--youtube-only",     action="store_true", help="Post to You
 parser.add_argument("--facebook-only",    action="store_true", help="Post to Facebook only")
 parser.add_argument("--instagram-only",   action="store_true", help="Post to Instagram only")
 parser.add_argument("--tiktok-only",      action="store_true", help="Post to TikTok only")
-parser.add_argument("--limit",            type=int, default=0, help="Upload only this many videos")
+parser.add_argument("--limit",            type=int, default=0, help="Upload only this many items per channel")
 args = parser.parse_args()
 
-# ─── Run ──────────────────────────────────────────────────────────────────────
+# ─── Channel configs ──────────────────────────────────────────────────────────
 
-if args.setup or args.setup_facebook:
-    setup_facebook(CREDS_FILE, FB_TOKEN_FILE)
+CREDS_FILE = "meta_app_credentials.json"
 
-if args.setup or args.setup_instagram:
-    setup_instagram(CREDS_FILE, IG_TOKEN_FILE)
+CHANNELS = [
+    {
+        "label":          "📚 Books Pages and Rain — Videos",
+        "profile":        "books-pages-and-rain",
+        "csv":            "videos_books_pages_and_rain.csv",
+        "folder":         "videos_books_pages_and_rain",
+        "results":        "upload_results_social_books-pages-and-rain.csv",
+        "tt_results":     "upload_results_tiktok_books-pages-and-rain.csv",
+        "yt_results":     "upload_results.csv",
+        "photos":         False,
+    },
+    {
+        "label":          "💃 Daisy and the Dance Team — Videos",
+        "profile":        "daisy-and-the-dance-team",
+        "csv":            "videos_daisy_and_the_dance_team.csv",
+        "folder":         "videos_daisy_and_the_dance_team",
+        "results":        "upload_results_social_daisy-and-the-dance-team.csv",
+        "tt_results":     "upload_results_tiktok_daisy-and-the-dance-team.csv",
+        "yt_results":     "upload_results_yt_daisy-and-the-dance-team.csv",
+        "photos":         False,
+    },
+    {
+        "label":          "💃 Daisy and the Dance Team — Photos",
+        "profile":        "daisy-and-the-dance-team",
+        "csv":            "photos_daisy_and_the_dance_team - videos_books_pages_and_rain.csv",
+        "folder":         "photos_daisy_and_the_dance_team",
+        "results":        "upload_results_social_photos_daisy-and-the-dance-team.csv",
+        "tt_results":     "upload_results_tiktok_photos_daisy-and-the-dance-team.csv",
+        "yt_results":     "",
+        "photos":         True,
+    },
+]
 
-if args.setup_tiktok:
-    setup_tiktok(CREDS_FILE, TT_TOKEN_FILE)
+# ─── Setup ────────────────────────────────────────────────────────────────────
 
-if not (args.setup or args.setup_facebook or args.setup_instagram or args.setup_tiktok):
+# Run setup once per unique profile
+if args.setup or args.setup_facebook or args.setup_instagram or args.setup_tiktok:
+    seen = set()
+    for ch in CHANNELS:
+        p = ch["profile"]
+        if p in seen:
+            continue
+        seen.add(p)
+        fb_token = f"token_fb_{p}.json"
+        ig_token = f"token_ig_{p}.json"
+        tt_token = f"token_tt_{p}.json"
+        print(f"\n{'═'*60}\n  Setting up: {p}\n{'═'*60}")
+        if args.setup or args.setup_facebook:
+            setup_facebook(CREDS_FILE, fb_token)
+        if args.setup or args.setup_instagram:
+            setup_instagram(CREDS_FILE, ig_token)
+        if args.setup_tiktok:
+            setup_tiktok(CREDS_FILE, tt_token)
+    sys.exit(0)
+
+# ─── Run all channels ─────────────────────────────────────────────────────────
+
+for ch in CHANNELS:
+    p = ch["profile"]
+    print(f"\n{'█'*60}")
+    print(f"  {ch['label']}")
+    print(f"{'█'*60}\n")
+
     run_upload_batch(
         creds_file      = CREDS_FILE,
-        fb_token_file   = FB_TOKEN_FILE,
-        ig_token_file   = IG_TOKEN_FILE,
-        tt_token_file   = TT_TOKEN_FILE,
-        csv_file        = CSV_FILE,
-        videos_folder   = VIDEOS_FOLDER,
-        results_file    = RESULTS_FILE,
-        tt_results_file = TT_RESULTS_FILE,
+        fb_token_file   = f"token_fb_{p}.json",
+        ig_token_file   = f"token_ig_{p}.json",
+        tt_token_file   = f"token_tt_{p}.json",
+        csv_file        = ch["csv"],
+        videos_folder   = ch["folder"],
+        results_file    = ch["results"],
+        tt_results_file = ch["tt_results"],
         dry_run         = args.dry_run,
         facebook_only   = args.facebook_only,
         instagram_only  = args.instagram_only,
-        youtube_only    = args.youtube_only,
+        youtube_only    = args.youtube_only if not ch["photos"] else False,
         tiktok_only     = args.tiktok_only,
-        yt_profile      = PROFILE_NAME,
-        yt_results_file = YT_RESULTS_FILE,
+        yt_profile      = p if not ch["photos"] else "",
+        yt_results_file = ch["yt_results"],
         limit           = args.limit,
     )
